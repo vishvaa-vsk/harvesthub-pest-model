@@ -1,104 +1,109 @@
 import os
 import tensorflow as tf
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 import datetime
 
-# Paths
+# =============================
+# ⚙️ TPU Setup
+# =============================
+try:
+    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
+    print("✅ TPU detected")
+    tf.config.experimental_connect_to_cluster(tpu)
+    tf.tpu.experimental.initialize_tpu_system(tpu)
+    strategy = tf.distribute.TPUStrategy(tpu)
+except ValueError:
+    print("⚠️ TPU not found, using CPU/GPU strategy")
+    strategy = tf.distribute.get_strategy()
+
+print("🔁 Replicas in sync:", strategy.num_replicas_in_sync)
+
+# =============================
+# 📁 Paths
+# =============================
 base_dir = "PestDetectionProject"
 train_dir = os.path.join(base_dir, "data/processed/train")
 val_dir = os.path.join(base_dir, "data/processed/val")
 model_dir = os.path.join(base_dir, "models")
-
-# Ensure model output directory exists
 os.makedirs(model_dir, exist_ok=True)
 
-# Image parameters
+# =============================
+# ⚙️ Hyperparams
+# =============================
 IMG_SIZE = (224, 224)
-BATCH_SIZE = 32
+BATCH_SIZE = 32 * strategy.num_replicas_in_sync
 EPOCHS = 20
 LEARNING_RATE = 0.0001
+AUTOTUNE = tf.data.AUTOTUNE
 
-# Data augmentation for training
-train_datagen = ImageDataGenerator(
-    rescale=1.0 / 255,
-    rotation_range=20,
-    zoom_range=0.15,
-    width_shift_range=0.1,
-    height_shift_range=0.1,
-    shear_range=0.15,
-    horizontal_flip=True,
-    fill_mode="nearest"
-)
+# =============================
+# 📊 TF Data Pipelines
+# =============================
+def prepare_dataset(dir_path, shuffle=True):
+    ds = tf.keras.preprocessing.image_dataset_from_directory(
+        dir_path,
+        image_size=IMG_SIZE,
+        batch_size=BATCH_SIZE,
+        label_mode='categorical'
+    )
+    if shuffle:
+        ds = ds.shuffle(1024)
+    ds = ds.cache().prefetch(buffer_size=AUTOTUNE)
+    return ds
 
-val_datagen = ImageDataGenerator(rescale=1.0 / 255)
+train_data = prepare_dataset(train_dir)
+val_data = prepare_dataset(val_dir, shuffle=False)
 
-# Load data
-train_data = train_datagen.flow_from_directory(
-    train_dir,
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical'
-)
+# =============================
+# 🔍 Class Info
+# =============================
+class_names = train_data.class_names
+num_classes = len(class_names)
+print(f"\n✅ Found {num_classes} classes: {class_names}")
 
-val_data = val_datagen.flow_from_directory(
-    val_dir,
-    target_size=IMG_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode='categorical'
-)
+# =============================
+# 🧠 Build Model (in scope)
+# =============================
+with strategy.scope():
+    base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+    base_model.trainable = False
 
-# Detect number of classes dynamically
-num_classes = len(train_data.class_indices)
-print(f"\n✅ Detected {num_classes} classes in training set.")
+    model = models.Sequential([
+        base_model,
+        layers.GlobalAveragePooling2D(),
+        layers.Dropout(0.3),
+        layers.Dense(num_classes, activation='softmax')
+    ])
 
-# Check for class mismatch
-train_classes = set(train_data.class_indices.keys())
-val_classes = set(val_data.class_indices.keys())
-missing_in_val = train_classes - val_classes
-if missing_in_val:
-    print(f"⚠️ Missing classes in validation set: {missing_in_val}\n")
+    model.compile(
+        optimizer=Adam(learning_rate=LEARNING_RATE),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
 
-# Build model
-base_model = MobileNetV2(weights="imagenet", include_top=False, input_shape=(224, 224, 3))
-base_model.trainable = False  # Freeze base
-
-model = models.Sequential([
-    base_model,
-    layers.GlobalAveragePooling2D(),
-    layers.Dropout(0.3),
-    layers.Dense(num_classes, activation='softmax')  # <-- Match class count
-])
-
-model.compile(
-    optimizer=Adam(learning_rate=LEARNING_RATE),
-    loss="categorical_crossentropy",
-    metrics=["accuracy"]
-)
-
-# Callbacks
+# =============================
+# ⏱️ Callbacks
+# =============================
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-checkpoint_path = os.path.join(model_dir, f"mobilenetv2_{timestamp}.h5")
+checkpoint_path = os.path.join(model_dir, f"mobilenetv2_tpu_tfdata_{timestamp}.h5")
 
 callbacks = [
     ModelCheckpoint(checkpoint_path, save_best_only=True, monitor="val_accuracy", mode="max"),
     EarlyStopping(patience=5, restore_best_weights=True)
 ]
 
-class_labels = list(train_data.class_indices.keys())
-print(class_labels)
-
-
-# Train model
-print("\n🚀 Starting training...\n")
+# =============================
+# 🚀 Train Model
+# =============================
+print("\n🚀 Starting training with tf.data + TPU...\n")
 
 history = model.fit(
     train_data,
-    epochs=EPOCHS,
     validation_data=val_data,
+    epochs=EPOCHS,
     callbacks=callbacks
 )
 
