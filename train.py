@@ -1,75 +1,69 @@
+# train.py
+
 import os
+import datetime
 import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras import layers, models
 from tensorflow.keras.applications import MobileNetV2
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
-import datetime
 
-# =============================
-# ⚙️ TPU Setup
-# =============================
-try:
-    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()
-    print("✅ TPU detected")
-    tf.config.experimental_connect_to_cluster(tpu)
-    tf.tpu.experimental.initialize_tpu_system(tpu)
-    strategy = tf.distribute.TPUStrategy(tpu)
-except ValueError:
-    print("⚠️ TPU not found, using CPU/GPU strategy")
-    strategy = tf.distribute.get_strategy()
+# ========= CONFIG =========
+IMG_SIZE = (224, 224)
+EPOCHS = 20
+BASE_LR = 1e-4
 
-print("🔁 Replicas in sync:", strategy.num_replicas_in_sync)
+# Adjust based on GPU capacity
+BATCH_SIZE = 32
 
-# =============================
-# 📁 Paths
-# =============================
+# ========= PATHS =========
 base_dir = "PestDetectionProject"
 train_dir = os.path.join(base_dir, "data/processed/train")
 val_dir = os.path.join(base_dir, "data/processed/val")
 model_dir = os.path.join(base_dir, "models")
 os.makedirs(model_dir, exist_ok=True)
 
-# =============================
-# ⚙️ Hyperparams
-# =============================
-IMG_SIZE = (224, 224)
-BATCH_SIZE = 32 * strategy.num_replicas_in_sync
-EPOCHS = 20
-LEARNING_RATE = 0.0001
-AUTOTUNE = tf.data.AUTOTUNE
+# ========= STRATEGY SETUP =========
+strategy = tf.distribute.get_strategy()  # Uses GPU if available
+print(f"✅ Running on strategy: {type(strategy).__name__} with {strategy.num_replicas_in_sync} replica(s)")
 
-# =============================
-# 📊 TF Data Pipelines
-# =============================
-def prepare_dataset(dir_path, shuffle=True):
-    ds = tf.keras.preprocessing.image_dataset_from_directory(
-        dir_path,
-        image_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        label_mode='categorical'
-    )
-    if shuffle:
-        ds = ds.shuffle(1024)
-    ds = ds.cache().prefetch(buffer_size=AUTOTUNE)
-    return ds
+# ========= DATA AUGMENTATION =========
+train_datagen = ImageDataGenerator(
+    rescale=1./255,
+    rotation_range=20,
+    zoom_range=0.15,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    shear_range=0.15,
+    horizontal_flip=True,
+    fill_mode="nearest"
+)
 
-train_data = prepare_dataset(train_dir)
-val_data = prepare_dataset(val_dir, shuffle=False)
+val_datagen = ImageDataGenerator(rescale=1./255)
 
-# =============================
-# 🔍 Class Info
-# =============================
-class_names = train_data.class_names
-num_classes = len(class_names)
-print(f"\n✅ Found {num_classes} classes: {class_names}")
+train_data = train_datagen.flow_from_directory(
+    train_dir,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='categorical'
+)
 
-# =============================
-# 🧠 Build Model (in scope)
-# =============================
+val_data = val_datagen.flow_from_directory(
+    val_dir,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='categorical'
+)
+
+num_classes = len(train_data.class_indices)
+class_labels = list(train_data.class_indices.keys())
+print(f"\n📊 Detected {num_classes} classes: {class_labels}")
+
+# ========= MODEL DEFINITION =========
 with strategy.scope():
-    base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-    base_model.trainable = False
+    base_model = MobileNetV2(weights="imagenet", include_top=False, input_shape=(224, 224, 3))
+    base_model.trainable = False  # Freeze base layers
 
     model = models.Sequential([
         base_model,
@@ -79,31 +73,27 @@ with strategy.scope():
     ])
 
     model.compile(
-        optimizer=Adam(learning_rate=LEARNING_RATE),
+        optimizer=Adam(learning_rate=BASE_LR),
         loss='categorical_crossentropy',
         metrics=['accuracy']
     )
 
-# =============================
-# ⏱️ Callbacks
-# =============================
+# ========= CALLBACKS =========
 timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-checkpoint_path = os.path.join(model_dir, f"mobilenetv2_tpu_tfdata_{timestamp}.h5")
+checkpoint_path = os.path.join(model_dir, f"mobilenetv2_{timestamp}.h5")
 
 callbacks = [
-    ModelCheckpoint(checkpoint_path, save_best_only=True, monitor="val_accuracy", mode="max"),
+    ModelCheckpoint(checkpoint_path, monitor="val_accuracy", save_best_only=True, mode="max"),
     EarlyStopping(patience=5, restore_best_weights=True)
 ]
 
-# =============================
-# 🚀 Train Model
-# =============================
-print("\n🚀 Starting training with tf.data + TPU...\n")
+# ========= TRAINING =========
+print("\n🚀 Starting training...\n")
 
 history = model.fit(
     train_data,
-    validation_data=val_data,
     epochs=EPOCHS,
+    validation_data=val_data,
     callbacks=callbacks
 )
 
