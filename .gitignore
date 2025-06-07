@@ -4,7 +4,7 @@ pestenv/
 # Ignore Kaggle API credentials
 kaggle.json
 
-PestDetectionProject/data/raw/*
+PestDetectionProject/data/processed/*
 
 # Ignore Python cache files
 __pycache__/
